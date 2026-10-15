@@ -1,5 +1,6 @@
 import * as git from 'isomorphic-git'
-import webHttp from 'isomorphic-git/http/web'
+import type { HttpClient } from 'isomorphic-git'
+import { request as webRequest } from 'isomorphic-git/http/web'
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore
 import FS from '@isomorphic-git/lightning-fs'
@@ -19,9 +20,6 @@ import { Folder, TItemLocation } from '../Tree'
 import CapacitorGitHttp from '../native/CapacitorGitHttp'
 
 declare const IS_BROWSER: boolean
-
-// In the app, fetch can't reach git servers and can't carry packfiles
-const http = IS_BROWSER ? webHttp : CapacitorGitHttp
 
 const LOCK_INTERVAL = 2 * 60 * 1000 // Lock every 2mins while syncing
 const LOCK_TIMEOUT = 15 * 60 * 1000 // Override lock 0.25h after last time lock has been set
@@ -120,7 +118,7 @@ export default class GitAdapter extends CachingAdapter {
     try {
       Logger.log('(git) fetch from remote')
       await git.fetch({
-        http,
+        http: this.getHttpClient(),
         fs: this.fs,
         dir: this.dir,
         ref: this.server.branch,
@@ -128,7 +126,7 @@ export default class GitAdapter extends CachingAdapter {
         singleBranch: true,
         remote: 'origin',
         depth: 10,
-        onAuth: () => this.onAuth()
+        ...this.remoteAuth()
       })
       Logger.log('(git) checkout branch ' + (this.server.branch))
       await git.checkout({ fs: this.fs, dir: this.dir, ref: this.server.branch })
@@ -154,12 +152,12 @@ export default class GitAdapter extends CachingAdapter {
         Logger.log('(git) push')
         const result = await git.push({
           fs: this.fs,
-          http,
+          http: this.getHttpClient(),
           dir: this.dir,
           ref: this.server.branch,
           remoteRef: this.server.branch,
           remote: 'origin',
-          onAuth: () => this.onAuth()
+          ...this.remoteAuth()
         })
         if (result.error) {
           throw new GitPushError(result.error)
@@ -227,10 +225,10 @@ export default class GitAdapter extends CachingAdapter {
         Logger.log('(git) push')
         const result = await git.push({
           fs: this.fs,
-          http,
+          http: this.getHttpClient(),
           dir: this.dir,
           remote: 'origin',
-          onAuth: () => this.onAuth()
+          ...this.remoteAuth()
         })
         if (result.error) {
           throw new GitPushError(result.error)
@@ -330,10 +328,10 @@ export default class GitAdapter extends CachingAdapter {
 
   async listServerLockTags(): Promise<string[]> {
     const refs = await git.listServerRefs({
-      http,
+      http: this.getHttpClient(),
       url: this.server.url,
       prefix: 'refs/tags/floccus-lock-',
-      onAuth: () => this.onAuth(),
+      ...this.remoteAuth(),
     })
     return refs
       .map((ref) => ref.ref.replace('refs/tags/', ''))
@@ -346,7 +344,7 @@ export default class GitAdapter extends CachingAdapter {
       Logger.log('(git) tag ' + tag)
       await git.tag({ fs: this.fs, dir: this.dir, ref: tag })
       Logger.log('(git) push tag ' + tag)
-      const result = await git.push({ fs: this.fs, http, dir: this.dir, ref: tag, remote: 'origin', onAuth: () => this.onAuth() })
+      const result = await git.push({ fs: this.fs, http: this.getHttpClient(), dir: this.dir, ref: tag, remote: 'origin', ...this.remoteAuth() })
       if (result.error) {
         throw new GitPushError(result.error)
       }
@@ -357,6 +355,47 @@ export default class GitAdapter extends CachingAdapter {
 
   async onAuth() {
     return { username: this.server.username, password: this.server.password }
+  }
+
+  /**
+   * The HTTP client for isomorphic-git. In the browser, fetch sends cookies
+   * and cached HTTP auth along unless told otherwise, so -- as in the other
+   * adapters -- they only go out when the account asks for client credentials.
+   */
+  private getHttpClient(): HttpClient {
+    if (!IS_BROWSER) {
+      // In the app, fetch can't reach git servers and can't carry packfiles
+      return CapacitorGitHttp
+    }
+    const credentials = this.server.includeCredentials ? 'include' : 'omit'
+    return {
+      request: (request) => webRequest({
+        ...request,
+        fetchOptions: { ...request.fetchOptions, credentials },
+      }),
+    }
+  }
+
+  /**
+   * The auth options for every isomorphic-git call that talks to the remote.
+   *
+   * isomorphic-git only calls onAuth after a 401, so its first request of
+   * each operation goes out without our credentials, and whatever the browser
+   * adds on its own answers instead: Gitea and Forgejo accept their web
+   * session cookie for git over HTTP, which makes every fetch and push
+   * succeed as the user logged into the web UI. An explicit Authorization
+   * header is checked before the session, so we send it from the start.
+   * onAuth stays as the retry after a 401.
+   *
+   * The headers have to be a new object for each call: isomorphic-git writes
+   * into the object it is given.
+   */
+  private remoteAuth(): { headers: Record<string, string>, onAuth: () => Promise<{ username: string, password: string }> } {
+    const { username = '', password = '' } = this.server
+    return {
+      headers: username || password ? { Authorization: basicAuthHeader(username, password) } : {},
+      onAuth: () => this.onAuth(),
+    }
   }
 
   async freeLock() {
@@ -371,7 +410,7 @@ export default class GitAdapter extends CachingAdapter {
       for (const tag of this.locked) {
         Logger.log('(git) push: delete tag ' + tag)
         // Ignoring result.error
-        await git.push({ fs: this.fs, http, dir: this.dir, ref: tag, delete: true, remote: 'origin', onAuth: () => this.onAuth() })
+        await git.push({ fs: this.fs, http: this.getHttpClient(), dir: this.dir, ref: tag, delete: true, remote: 'origin', ...this.remoteAuth() })
       }
       this.locked = []
       return true
@@ -390,10 +429,10 @@ export default class GitAdapter extends CachingAdapter {
     // we pass the commit SHA as `ref` (expand accepts a raw SHA) and the tag's
     // full ref name as `remoteRef`.
     const refs = await git.listServerRefs({
-      http,
+      http: this.getHttpClient(),
       url: this.server.url,
       prefix: 'refs/tags/floccus-lock-',
-      onAuth: () => this.onAuth(),
+      ...this.remoteAuth(),
     })
     for (const { ref, oid } of refs) {
       if (!ref.replace('refs/tags/', '').startsWith('floccus-lock-')) {
@@ -401,7 +440,7 @@ export default class GitAdapter extends CachingAdapter {
       }
       Logger.log('(git) push: delete tag ' + ref)
       // ignoring result.error
-      await git.push({ fs, http, dir: this.dir, ref: oid, remoteRef: ref, delete: true, remote: 'origin', onAuth: () => this.onAuth() })
+      await git.push({ fs, http: this.getHttpClient(), dir: this.dir, ref: oid, remoteRef: ref, delete: true, remote: 'origin', ...this.remoteAuth() })
     }
   }
 
@@ -481,19 +520,30 @@ export default class GitAdapter extends CachingAdapter {
     }
     const result = await git.push({
       fs,
-      http,
+      http: this.getHttpClient(),
       dir: this.dir,
       ref: this.server.branch,
       remoteRef: this.server.branch,
       remote: 'origin',
       force: true,
-      onAuth: () => this.onAuth()
+      ...this.remoteAuth()
     })
     if (result.error) {
       throw new GitPushError(result.error)
     }
     await this.clearAllLocks(fs)
   }
+}
+
+function basicAuthHeader(username: string, password: string): string {
+  // btoa only takes latin1, so encode non-ASCII credentials as UTF-8 first,
+  // like isomorphic-git does for the header it builds after a 401
+  const bytes = new TextEncoder().encode(username + ':' + password)
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+  return 'Basic ' + btoa(binary)
 }
 
 function createXBEL(rootFolder, highestId) {
